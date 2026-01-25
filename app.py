@@ -7,6 +7,9 @@ os.environ['OTEL_SDK_DISABLED'] = 'true'
 # Set dummy OpenAI key to prevent CrewAI from complaining
 os.environ['OPENAI_API_KEY'] = 'sk-dummy-key-for-local-llm'
 os.environ['OPENAI_MODEL_NAME'] = 'gpt-4'  # Dummy model name
+# Disable interactive prompts
+os.environ['CREWAI_DISABLE_TELEMETRY_PROMPT'] = 'true'
+os.environ['CREWAI_STORAGE_DIR'] = './.crewai_storage'
 
 # Suppress deprecation warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -148,33 +151,70 @@ class SeleniumSearcher:
     def __init__(self, browser_type="chrome"):
         self.browser_type = browser_type
         self.driver = None
+        self.is_mac_arm = self._check_mac_arm()
+    
+    def _check_mac_arm(self):
+        """Check if running on Mac ARM (M1/M2/M3)"""
+        import platform
+        return platform.system() == 'Darwin' and platform.machine() == 'arm64'
     
     def _init_driver(self):
         """Initialize the webdriver"""
         try:
             if self.browser_type == "chrome":
                 chrome_options = ChromeOptions()
-                chrome_options.add_argument('--headless')
+                chrome_options.add_argument('--headless=new')  # New headless mode
                 chrome_options.add_argument('--no-sandbox')
                 chrome_options.add_argument('--disable-dev-shm-usage')
                 chrome_options.add_argument('--disable-gpu')
                 chrome_options.add_argument('--window-size=1920,1080')
-                chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+                chrome_options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
+                chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+                chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                chrome_options.add_experimental_option('useAutomationExtension', False)
                 
-                service = ChromeService(ChromeDriverManager().install())
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                # MacOS ARM-specific settings
+                if self.is_mac_arm:
+                    chrome_options.add_argument('--disable-software-rasterizer')
+                    chrome_options.add_argument('--disable-extensions')
+                    # Don't use sandbox on Mac ARM due to compatibility issues
+                    chrome_options.add_argument('--no-sandbox')
+                
+                try:
+                    service = ChromeService(ChromeDriverManager().install())
+                    self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                except Exception as e:
+                    # Fallback: try without service
+                    st.warning(f"ChromeDriver manager failed, trying system Chrome: {str(e)}")
+                    self.driver = webdriver.Chrome(options=chrome_options)
+                    
             else:  # firefox
                 firefox_options = FirefoxOptions()
                 firefox_options.add_argument('--headless')
                 firefox_options.add_argument('--width=1920')
                 firefox_options.add_argument('--height=1080')
                 
-                service = FirefoxService(GeckoDriverManager().install())
-                self.driver = webdriver.Firefox(service=service, options=firefox_options)
+                # MacOS-specific Firefox settings
+                if self.is_mac_arm:
+                    firefox_options.set_preference('media.navigator.enabled', False)
+                    firefox_options.set_preference('media.peerconnection.enabled', False)
+                
+                try:
+                    service = FirefoxService(GeckoDriverManager().install())
+                    self.driver = webdriver.Firefox(service=service, options=firefox_options)
+                except Exception as e:
+                    # Fallback: try without service
+                    st.warning(f"GeckoDriver manager failed, trying system Firefox: {str(e)}")
+                    self.driver = webdriver.Firefox(options=firefox_options)
             
+            # Set page load timeout
+            self.driver.set_page_load_timeout(30)
             return True
+            
         except Exception as e:
             st.error(f"Failed to initialize {self.browser_type} driver: {str(e)}")
+            if self.is_mac_arm:
+                st.info("💡 **MacOS M1/M2 Tip**: If Chrome fails, try Firefox or install Chrome for ARM from https://www.google.com/chrome/")
             return False
     
     def search_google(self, query, max_results=5):
@@ -187,7 +227,17 @@ class SeleniumSearcher:
             # Navigate to Google
             search_url = f"https://www.google.com/search?q={requests.utils.quote(query)}"
             self.driver.get(search_url)
-            time.sleep(2)  # Wait for page load
+            
+            # Wait for results to load (with timeout)
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.g"))
+                )
+            except Exception:
+                # If wait fails, still try to parse what loaded
+                pass
+            
+            time.sleep(1)  # Small additional wait
             
             # Parse results
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
@@ -233,7 +283,16 @@ class SeleniumSearcher:
             # Navigate to Bing
             search_url = f"https://www.bing.com/search?q={requests.utils.quote(query)}"
             self.driver.get(search_url)
-            time.sleep(2)
+            
+            # Wait for results
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "li.b_algo"))
+                )
+            except Exception:
+                pass
+            
+            time.sleep(1)
             
             # Parse results
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
@@ -400,7 +459,10 @@ def step1_interpret_and_plan(user_request: str, llm):
         agents=[interpreter_agent],
         tasks=[interpret_task],
         process=Process.sequential,
-        verbose=True
+        verbose=True,
+        memory=False,
+        cache=False,
+        output_log_file=False
     )
     
     with st.spinner("Creating research plan..."):
@@ -444,7 +506,10 @@ def step2_initial_research(research_plan: str, llm):
         agents=[researcher_agent],
         tasks=[research_task],
         process=Process.sequential,
-        verbose=True
+        verbose=True,
+        memory=False,
+        cache=False,
+        output_log_file=False
     )
     
     with st.spinner("Conducting initial research..."):
@@ -495,7 +560,10 @@ def step3_gap_analysis(research_plan: str, initial_research: str, llm):
         agents=[analyst_agent],
         tasks=[gap_task],
         process=Process.sequential,
-        verbose=True
+        verbose=True,
+        memory=False,
+        cache=False,
+        output_log_file=False
     )
     
     with st.spinner("Analyzing research gaps..."):
@@ -552,7 +620,10 @@ def step4_web_research(gap_analysis: str, llm):
         agents=[web_researcher_agent],
         tasks=[web_research_task],
         process=Process.sequential,
-        verbose=True
+        verbose=True,
+        memory=False,
+        cache=False,
+        output_log_file=False
     )
     
     with st.spinner("Searching the web for additional information..."):
@@ -609,7 +680,10 @@ def step5_create_blog(research_plan: str, initial_research: str, web_research: s
         agents=[writer_agent],
         tasks=[writing_task],
         process=Process.sequential,
-        verbose=True
+        verbose=True,
+        memory=False,
+        cache=False,
+        output_log_file=False
     )
     
     with st.spinner("Writing blog post..."):
@@ -663,7 +737,10 @@ def step6_convert_to_html(blog_post: str, llm):
         agents=[html_developer_agent],
         tasks=[html_task],
         process=Process.sequential,
-        verbose=True
+        verbose=True,
+        memory=False,
+        cache=False,
+        output_log_file=False
     )
     
     with st.spinner("Converting to HTML..."):
@@ -765,7 +842,18 @@ def main():
                     help="Choose which browser to use for headless searching"
                 )
                 st.session_state.browser_type = browser_type
-                st.info(f"💡 Using {browser_type.capitalize()} in headless mode for web searches")
+                
+                # Platform-specific guidance
+                import platform
+                if platform.system() == 'Darwin':  # MacOS
+                    if platform.machine() == 'arm64':  # M1/M2/M3
+                        st.info("🍎 **MacOS ARM Detected**\n\n"
+                               "**Recommended:** Use Firefox for best compatibility\n\n"
+                               "**Chrome issues?** Install ARM version from [google.com/chrome](https://www.google.com/chrome/)")
+                    else:
+                        st.info(f"🍎 **MacOS Intel** - Both browsers should work well")
+                else:
+                    st.info(f"💡 Using {browser_type.capitalize()} in headless mode")
             else:
                 st.info("💡 Using DuckDuckGo API (may be rate-limited)")
         else:

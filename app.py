@@ -440,7 +440,7 @@ def step1_interpret_and_plan(user_request: str, llm):
         Analyze this research request: "{user_request}"
         
         Create a detailed research plan that includes:
-        1. Main research questions (3-5 questions)
+        1. Main research questions (5-6 questions)
         2. Key topics to investigate
         3. Suggested search queries
         4. Expected information structure
@@ -602,7 +602,7 @@ def step4_web_research(gap_analysis: str, llm):
         4. Note sources when available
         
         IMPORTANT: 
-        - Focus on 2-3 most critical gaps to avoid rate limiting
+        - Focus on 4-5 most critical gaps to avoid rate limiting
         - If web search consistently fails, compile findings from searches that did work
         - Document which gaps could not be filled due to search limitations
         - Provide a summary even if some searches fail
@@ -645,7 +645,7 @@ def step5_create_blog(research_plan: str, initial_research: str, web_research: s
     writer_agent = Agent(
         role='Technical Writer',
         goal='Create a comprehensive, well-structured blog post with proper citations',
-        backstory='You are an expert technical writer who creates engaging, informative content.',
+        backstory='You are an expert technical writer who creates engaging, informative content that is thorough and comprehensive.',
         llm=llm_string,
         verbose=True,
         allow_delegation=False
@@ -1060,3 +1060,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

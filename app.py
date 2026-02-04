@@ -43,6 +43,7 @@ from bs4 import BeautifulSoup
 import requests
 import subprocess
 import time
+from urllib.parse import urlparse
 
 # Initialize session state
 if 'workflow_stage' not in st.session_state:
@@ -65,6 +66,16 @@ if 'browser_type' not in st.session_state:
     st.session_state.browser_type = "chrome"
 if 'search_method' not in st.session_state:
     st.session_state.search_method = "selenium"
+if 'search_metrics' not in st.session_state:
+    st.session_state.search_metrics = {
+        'queries_executed': 0,
+        'queries_successful': 0,
+        'total_results_found': 0,
+        'failed_queries': [],
+        'successful_queries': [],
+        'query_times': [],
+        'content_extracted': 0
+    }
 
 # Configure page
 st.set_page_config(page_title="AI Research Agent", layout="wide")
@@ -134,6 +145,187 @@ def verify_model_exists(model_name):
         return False
     except Exception:
         return False
+
+# Content Extraction and Validation Functions
+class ContentExtractor:
+    """Extract main content from web pages"""
+
+    def __init__(self):
+        self.timeout = 10
+        self.max_content_length = 5000
+
+    def fetch_page_content(self, url: str) -> dict:
+        """Fetch and extract main content from a URL"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+            }
+
+            response = requests.get(url, headers=headers, timeout=self.timeout)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.content, 'html.parser')
+
+            # Remove script, style, and other non-content elements
+            for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'ads']):
+                tag.decompose()
+
+            # Try to find main content areas
+            main_content = None
+
+            # Look for common content containers
+            for selector in ['article', 'main', '[role="main"]', '.content', '.post', '.article']:
+                content = soup.select_one(selector)
+                if content:
+                    main_content = content
+                    break
+
+            # Fallback to body
+            if not main_content:
+                main_content = soup.body
+
+            if main_content:
+                # Extract text
+                text = main_content.get_text(separator='\n', strip=True)
+
+                # Clean up extra whitespace
+                text = re.sub(r'\n\s*\n', '\n\n', text)
+                text = re.sub(r' +', ' ', text)
+
+                # Limit length
+                if len(text) > self.max_content_length:
+                    text = text[:self.max_content_length] + "..."
+
+                return {
+                    'success': True,
+                    'content': text,
+                    'length': len(text),
+                    'url': url
+                }
+
+            return {
+                'success': False,
+                'content': '',
+                'error': 'No content found',
+                'url': url
+            }
+
+        except requests.Timeout:
+            return {
+                'success': False,
+                'content': '',
+                'error': 'Request timeout',
+                'url': url
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'content': '',
+                'error': str(e),
+                'url': url
+            }
+
+def validate_search_result(result: dict, query: str) -> dict:
+    """
+    Score and validate search result relevance
+    Returns: dict with 'score' (0-1) and 'reasons' list
+    """
+    score = 0.0
+    reasons = []
+
+    # Extract query terms (remove common stop words and operators)
+    stop_words = {'what', 'how', 'why', 'when', 'where', 'is', 'are', 'the', 'a', 'an', 'and', 'or', 'of', 'in', 'to', 'for'}
+    query_terms = set([term.lower().strip('"') for term in query.split() if term.lower() not in stop_words and len(term) > 2])
+
+    # Combine title and snippet for analysis
+    result_text = (result.get('title', '') + ' ' + result.get('snippet', '')).lower()
+
+    # Check term overlap - MORE LENIENT (give base score of 0.2 just for having a result)
+    base_score = 0.2  # Start with base score
+    score += base_score
+    reasons.append("Search result returned")
+
+    if query_terms:
+        matching_terms = sum(1 for term in query_terms if term in result_text)
+        term_score = matching_terms / len(query_terms)
+        score += term_score * 0.3  # Reduced from 0.4 to be more lenient
+        if term_score > 0.3:  # Lower threshold
+            reasons.append(f"Term match ({matching_terms}/{len(query_terms)} terms)")
+        elif matching_terms > 0:
+            reasons.append(f"Partial term match ({matching_terms} terms)")
+
+    # Boost recent content (2024, 2025, 2026)
+    current_year = datetime.now().year
+    recent_years = [str(current_year), str(current_year - 1), str(current_year - 2)]
+    if any(year in result_text for year in recent_years):
+        score += 0.15
+        reasons.append("Contains recent year")
+
+    # Check for authoritative domains
+    url = result.get('link', '')
+    authoritative_domains = ['.edu', '.gov', '.org', 'wikipedia.org', 'nature.com',
+                            'science.org', 'ieee.org', 'acm.org', 'nih.gov', 'springer.com',
+                            'elsevier.com', 'wiley.com', 'sage', 'academic', 'university']
+    if any(domain in url.lower() for domain in authoritative_domains):
+        score += 0.15
+        reasons.append("Authoritative domain")
+
+    # Check for data/statistics indicators - expanded list
+    data_indicators = ['statistics', 'data', 'study', 'research', 'report', 'analysis',
+                      'survey', 'findings', 'percent', '%', 'evaluation', 'assessment',
+                      'curriculum', 'program', 'framework', 'implementation', 'case study']
+    if any(indicator in result_text for indicator in data_indicators):
+        score += 0.1
+        reasons.append("Contains relevant keywords")
+
+    # Check for academic/educational indicators
+    academic_indicators = ['college', 'university', 'education', 'student', 'faculty',
+                          'course', 'training', 'learning', 'teaching', 'academic']
+    if any(indicator in result_text for indicator in academic_indicators):
+        score += 0.1
+        reasons.append("Educational content")
+
+    # DON'T penalize short snippets as harshly (some academic sites have short snippets)
+    snippet = result.get('snippet', '')
+    if len(snippet) < 30:  # Only penalize VERY short snippets
+        score *= 0.8  # Less harsh penalty
+        reasons.append("Very short snippet")
+
+    # Check title is not generic error
+    title = result.get('title', '').lower()
+    error_indicators = ['404', 'not found', 'error', 'no results', 'page not found']
+    if any(indicator in title for indicator in error_indicators):
+        score = 0.0
+        reasons = ["Error page detected"]
+
+    return {
+        'score': min(score, 1.0),  # Cap at 1.0
+        'reasons': reasons,
+        'valid': score >= 0.2  # LOWERED threshold from 0.3 to 0.2 to be more inclusive
+    }
+
+def update_search_metrics(query: str, success: bool, num_results: int = 0,
+                         elapsed_time: float = 0):
+    """Update search metrics in session state"""
+    metrics = st.session_state.search_metrics
+
+    metrics['queries_executed'] += 1
+    if success:
+        metrics['queries_successful'] += 1
+        metrics['total_results_found'] += num_results
+        metrics['successful_queries'].append({
+            'query': query,
+            'results': num_results,
+            'time': elapsed_time
+        })
+    else:
+        metrics['failed_queries'].append({
+            'query': query,
+            'time': elapsed_time
+        })
+
+    if elapsed_time > 0:
+        metrics['query_times'].append(elapsed_time)
 
 # Initialize Ollama LLM
 @st.cache_resource
@@ -340,36 +532,87 @@ class WebSearchTool(BaseTool):
     description: str = "Search the web for information. Input should be a search query string. Returns top search results with titles, links, and snippets."
     
     def _run(self, query: str) -> str:
-        """Search the web using selected method"""
+        """Search the web using selected method with validation and content extraction"""
+        start_time = time.time()
         search_method = st.session_state.get('search_method', 'selenium')
         browser_type = st.session_state.get('browser_type', 'chrome')
-        
+
         if search_method == 'selenium':
-            return self._selenium_search(query, browser_type)
+            result = self._selenium_search(query, browser_type)
         else:
-            return self._ddg_search(query)
+            result = self._ddg_search(query)
+
+        # Track elapsed time
+        elapsed_time = time.time() - start_time
+
+        # Parse results to check success
+        try:
+            results_list = json.loads(result)
+            num_results = len([r for r in results_list if r.get('link', '')])
+            success = num_results > 0 and 'error' not in results_list[0].get('title', '').lower()
+            update_search_metrics(query, success, num_results, elapsed_time)
+        except:
+            update_search_metrics(query, False, 0, elapsed_time)
+
+        return result
     
     def _selenium_search(self, query: str, browser_type: str) -> str:
-        """Search using Selenium headless browser"""
+        """Search using Selenium headless browser with validation and content extraction"""
         searcher = SeleniumSearcher(browser_type)
-        
+        extractor = ContentExtractor()
+
         try:
             # Try Google first
             results = searcher.search_google(query, max_results=5)
-            
+
             # If Google fails, try Bing
             if not results:
                 results = searcher.search_bing(query, max_results=5)
-            
+
             if results:
-                return json.dumps(results, indent=2)
-            
+                # Validate and score ALL results (even if they don't pass threshold)
+                scored_results = []
+                for result in results:
+                    validation = validate_search_result(result, query)
+                    result['relevance_score'] = validation['score']
+                    result['validation_reasons'] = validation['reasons']
+                    scored_results.append(result)
+
+                # Sort by relevance score
+                scored_results.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+
+                # If NO results pass validation threshold (0.3), still return top 3
+                # but warn about low quality
+                valid_results = [r for r in scored_results if r['relevance_score'] >= 0.3]
+
+                if valid_results:
+                    results_to_return = valid_results
+                else:
+                    # All results filtered - return top 3 anyway with warning
+                    results_to_return = scored_results[:3]
+                    for r in results_to_return:
+                        r['low_quality_warning'] = 'This result scored below quality threshold but is included as best available'
+
+                # Extract content from top 3 results
+                for i, result in enumerate(results_to_return[:3]):
+                    if result.get('link'):
+                        content_data = extractor.fetch_page_content(result['link'])
+                        if content_data['success']:
+                            result['extracted_content'] = content_data['content']
+                            result['content_length'] = content_data['length']
+                            st.session_state.search_metrics['content_extracted'] += 1
+                        else:
+                            result['extraction_error'] = content_data.get('error', 'Unknown error')
+
+                if results_to_return:
+                    return json.dumps(results_to_return, indent=2)
+
             return json.dumps([{
                 'title': 'No results found',
                 'link': '',
                 'snippet': f'No web results found for "{query}". Please try a different search query.'
             }], indent=2)
-            
+
         except Exception as e:
             return json.dumps([{
                 'title': 'Search error',
@@ -380,7 +623,9 @@ class WebSearchTool(BaseTool):
             searcher.close()
     
     def _ddg_search(self, query: str) -> str:
-        """Search using DuckDuckGo with retry logic"""
+        """Search using DuckDuckGo with retry logic, validation and content extraction"""
+        extractor = ContentExtractor()
+
         for attempt in range(3):
             try:
                 results = []
@@ -392,13 +637,48 @@ class WebSearchTool(BaseTool):
                             'link': r.get('href', ''),
                             'snippet': r.get('body', 'No snippet available')
                         })
-                
+
                 if results:
-                    return json.dumps(results, indent=2)
-                
+                    # Validate and score ALL results (even if they don't pass threshold)
+                    scored_results = []
+                    for result in results:
+                        validation = validate_search_result(result, query)
+                        result['relevance_score'] = validation['score']
+                        result['validation_reasons'] = validation['reasons']
+                        scored_results.append(result)
+
+                    # Sort by relevance score
+                    scored_results.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+
+                    # If NO results pass validation threshold (0.3), still return top 3
+                    # but warn about low quality
+                    valid_results = [r for r in scored_results if r['relevance_score'] >= 0.3]
+
+                    if valid_results:
+                        results_to_return = valid_results
+                    else:
+                        # All results filtered - return top 3 anyway with warning
+                        results_to_return = scored_results[:3]
+                        for r in results_to_return:
+                            r['low_quality_warning'] = 'This result scored below quality threshold but is included as best available'
+
+                    # Extract content from top 3 results
+                    for i, result in enumerate(results_to_return[:3]):
+                        if result.get('link'):
+                            content_data = extractor.fetch_page_content(result['link'])
+                            if content_data['success']:
+                                result['extracted_content'] = content_data['content']
+                                result['content_length'] = content_data['length']
+                                st.session_state.search_metrics['content_extracted'] += 1
+                            else:
+                                result['extraction_error'] = content_data.get('error', 'Unknown error')
+
+                    if results_to_return:
+                        return json.dumps(results_to_return, indent=2)
+
                 if attempt < 2:
                     time.sleep(2)
-                    
+
             except Exception as e:
                 if attempt < 2:
                     time.sleep(2)
@@ -408,7 +688,7 @@ class WebSearchTool(BaseTool):
                     'link': '',
                     'snippet': f'Unable to perform web search for "{query}". Error: {str(e)}'
                 }], indent=2)
-        
+
         return json.dumps([{
             'title': 'No results found',
             'link': '',
@@ -537,23 +817,72 @@ def step3_gap_analysis(research_plan: str, initial_research: str, llm):
         description=f"""
         Research Plan:
         {research_plan}
-        
+
         Initial Research:
         {initial_research}
-        
+
         Analyze the initial research and identify:
         1. Missing information or unanswered questions
         2. Areas where current information might be outdated
         3. Topics requiring recent data or statistics
         4. Specific search queries needed to fill gaps
-        
+
+        SEARCH QUERY BEST PRACTICES:
+        When generating search queries, follow these rules to maximize relevance:
+
+        1. BE SPECIFIC: Include exact names, technologies, versions, or models
+           - Good: "Tesla Model Y safety ratings NHTSA 2025"
+           - Bad: "electric car safety"
+
+        2. ADD TEMPORAL MARKERS: Include year or recency indicators
+           - Good: "machine learning trends 2025 statistics"
+           - Bad: "machine learning trends"
+
+        3. USE QUALIFYING TERMS: Add context words that indicate data quality
+           - Include: "statistics", "data", "research", "study", "report", "analysis"
+           - Good: "renewable energy adoption rate 2025 statistics"
+           - Bad: "renewable energy"
+
+        4. AVOID VAGUE QUESTIONS: Don't use conversational query formats
+           - Good: "climate change impact agriculture yield statistics"
+           - Bad: "how does climate change affect farming"
+
+        5. INCLUDE DOMAIN INDICATORS: Add terms that help find authoritative sources
+           - For science: "peer reviewed", "published research"
+           - For data: "official statistics", "government report"
+           - For tech: "documentation", "technical specifications"
+
+        6. GENERATE MULTIPLE VARIANTS: Provide 2-3 alternative queries per gap
+           - Different phrasings catch different sources
+           - Mix general and specific terms
+
+        GOOD QUERY EXAMPLES:
+        - "quantum computing commercial applications 2025 report"
+        - "artificial intelligence job market impact statistics 2025"
+        - "coronavirus vaccine efficacy peer reviewed studies 2024"
+        - "electric vehicle battery cost per kWh 2025 data"
+
+        BAD QUERY EXAMPLES:
+        - "what is quantum computing" (too basic/vague)
+        - "AI" (too broad, no context)
+        - "recent developments" (no specificity)
+        - "how does it work" (conversational, unclear)
+
         Format as JSON with:
-        - gaps: list of identified gaps
-        - priority: high/medium/low for each gap
-        - search_queries: specific queries to fill each gap
+        {{
+          "gaps": [
+            {{
+              "gap_description": "specific description of missing info",
+              "priority": "high/medium/low",
+              "information_type": "statistic/news/research/comparison/technical",
+              "time_sensitivity": "current/recent/historical",
+              "search_queries": ["query1", "query2", "query3"]
+            }}
+          ]
+        }}
         """,
         agent=analyst_agent,
-        expected_output="Gap analysis with prioritized search queries"
+        expected_output="Gap analysis with prioritized, well-crafted search queries following best practices"
     )
     
     crew = Crew(
@@ -593,27 +922,42 @@ def step4_web_research(gap_analysis: str, llm):
         description=f"""
         Gap Analysis:
         {gap_analysis}
-        
+
         Use the web_search tool to find information for the most important identified gaps.
+
+        UNDERSTANDING SEARCH RESULTS:
+        The web_search tool returns enhanced results with:
+        - title, link, snippet: Basic search result info
+        - relevance_score: How well the result matches your query (0-1)
+        - validation_reasons: Why this result was considered relevant
+        - extracted_content: Full article text from the webpage (when available)
+        - content_length: Length of extracted content
+
+        USE THE EXTRACTED CONTENT for detailed information instead of just snippets!
+
         For each gap:
-        1. Try searching with clear, specific queries
-        2. If a search fails or returns no results, note this and move to the next gap
-        3. Summarize findings from successful searches
-        4. Note sources when available
-        
-        IMPORTANT: 
-        - Focus on 4-5 most critical gaps to avoid rate limiting
-        - If web search consistently fails, compile findings from searches that did work
-        - Document which gaps could not be filled due to search limitations
-        - Provide a summary even if some searches fail
-        
+        1. Use the provided search queries (they're optimized for relevance)
+        2. Review the extracted_content field for comprehensive information
+        3. If extracted_content is available, use it for detailed facts and data
+        4. If extraction failed, fall back to the snippet
+        5. Cite sources using the provided links
+
+        IMPORTANT:
+        - Focus on 4-5 most critical gaps (high priority first)
+        - Extracted content provides much more detail than snippets
+        - Check relevance_score to prioritize which results to use
+        - If a search fails, try alternative queries from the gap analysis
+        - Document which gaps could not be filled and why
+
         Compile findings into a report that includes:
-        - Information found from successful searches
-        - Sources/links when available
+        - Detailed information from extracted content (not just snippets!)
+        - Specific data, statistics, and facts found
+        - Sources/links for all claims
+        - Relevance scores to indicate confidence in sources
         - List of gaps that could not be filled and why
         """,
         agent=web_researcher_agent,
-        expected_output="Web research findings with sources, including documentation of any search failures"
+        expected_output="Comprehensive web research findings using full extracted content, with sources and confidence indicators"
     )
     
     crew = Crew(
@@ -883,6 +1227,17 @@ def main():
                 st.markdown(f"{stage}")
         
         st.markdown("---")
+        # Search metrics summary in sidebar
+        if st.session_state.workflow_stage >= 3:
+            metrics = st.session_state.search_metrics
+            if metrics['queries_executed'] > 0:
+                st.markdown("### 📊 Search Metrics")
+                success_rate = (metrics['queries_successful'] / metrics['queries_executed'] * 100) if metrics['queries_executed'] > 0 else 0
+                st.markdown(f"**Queries:** {metrics['queries_executed']}")
+                st.markdown(f"**Success:** {success_rate:.0f}%")
+                st.markdown(f"**Content:** {metrics['content_extracted']}")
+                st.markdown("---")
+
         if st.button("🔄 Reset Workflow"):
             for key in list(st.session_state.keys()):
                 del st.session_state[key]
@@ -983,7 +1338,45 @@ def main():
                 )
             
             st.text_area("Web Research Findings", st.session_state.web_research, height=400)
-            
+
+            # Display search analytics
+            metrics = st.session_state.search_metrics
+            if metrics['queries_executed'] > 0:
+                with st.expander("🔍 Search Performance Analytics", expanded=False):
+                    # Summary metrics
+                    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+
+                    with col_m1:
+                        st.metric("Total Queries", metrics['queries_executed'])
+
+                    with col_m2:
+                        success_rate = (metrics['queries_successful'] / metrics['queries_executed'] * 100) if metrics['queries_executed'] > 0 else 0
+                        st.metric("Success Rate", f"{success_rate:.1f}%")
+
+                    with col_m3:
+                        avg_results = (metrics['total_results_found'] / metrics['queries_successful']) if metrics['queries_successful'] > 0 else 0
+                        st.metric("Avg Results/Query", f"{avg_results:.1f}")
+
+                    with col_m4:
+                        st.metric("Content Extracted", metrics['content_extracted'])
+
+                    # Query timing
+                    if metrics['query_times']:
+                        avg_time = sum(metrics['query_times']) / len(metrics['query_times'])
+                        st.markdown(f"**Average Query Time:** {avg_time:.2f}s")
+
+                    # Successful queries
+                    if metrics['successful_queries']:
+                        st.markdown("**✅ Successful Queries:**")
+                        for sq in metrics['successful_queries'][-5:]:  # Show last 5
+                            st.markdown(f"- `{sq['query']}` - {sq['results']} results ({sq['time']:.2f}s)")
+
+                    # Failed queries
+                    if metrics['failed_queries']:
+                        st.markdown("**❌ Failed Queries:**")
+                        for fq in metrics['failed_queries'][-5:]:  # Show last 5
+                            st.markdown(f"- `{fq['query']}` ({fq['time']:.2f}s)")
+
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("✅ Proceed to Blog Creation", type="primary"):

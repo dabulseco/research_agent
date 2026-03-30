@@ -26,6 +26,12 @@ except ImportError:
 from crewai.tools import BaseTool
 from langchain_core.tools import Tool
 from duckduckgo_search import DDGS
+
+try:
+    from tavily import TavilyClient
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -539,6 +545,8 @@ class WebSearchTool(BaseTool):
 
         if search_method == 'selenium':
             result = self._selenium_search(query, browser_type)
+        elif search_method == 'tavily':
+            result = self._tavily_search(query)
         else:
             result = self._ddg_search(query)
 
@@ -694,6 +702,73 @@ class WebSearchTool(BaseTool):
             'link': '',
             'snippet': f'No web results found for "{query}".'
         }], indent=2)
+
+    def _tavily_search(self, query: str) -> str:
+        """Search using Tavily API with validation and content extraction"""
+        if not TAVILY_AVAILABLE:
+            return json.dumps([{
+                'title': 'Tavily not available',
+                'link': '',
+                'snippet': 'tavily-python package is not installed. Please install it with: pip install tavily-python'
+            }], indent=2)
+
+        api_key = st.session_state.get('tavily_api_key', '') or os.environ.get('TAVILY_API_KEY', '')
+        if not api_key:
+            return json.dumps([{
+                'title': 'Tavily API key missing',
+                'link': '',
+                'snippet': 'Please provide a TAVILY_API_KEY in the sidebar or set it as an environment variable.'
+            }], indent=2)
+
+        try:
+            client = TavilyClient(api_key=api_key)
+            response = client.search(query, max_results=5, search_depth="basic")
+
+            results = []
+            for r in response.get("results", []):
+                results.append({
+                    'title': r.get('title', 'No title'),
+                    'link': r.get('url', ''),
+                    'snippet': r.get('content', 'No snippet available'),
+                    'relevance_score': r.get('score', 0.0),
+                })
+
+            if results:
+                # Tavily results already come ranked by relevance;
+                # apply the same validation/scoring pipeline for consistency
+                scored_results = []
+                for result in results:
+                    validation = validate_search_result(result, query)
+                    # Keep the higher of Tavily's score and local validation
+                    result['relevance_score'] = max(result.get('relevance_score', 0), validation['score'])
+                    result['validation_reasons'] = validation['reasons']
+                    scored_results.append(result)
+
+                scored_results.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+
+                valid_results = [r for r in scored_results if r['relevance_score'] >= 0.3]
+                if valid_results:
+                    results_to_return = valid_results
+                else:
+                    results_to_return = scored_results[:3]
+                    for r in results_to_return:
+                        r['low_quality_warning'] = 'This result scored below quality threshold but is included as best available'
+
+                if results_to_return:
+                    return json.dumps(results_to_return, indent=2)
+
+            return json.dumps([{
+                'title': 'No results found',
+                'link': '',
+                'snippet': f'No web results found for "{query}" via Tavily.'
+            }], indent=2)
+
+        except Exception as e:
+            return json.dumps([{
+                'title': 'Tavily search error',
+                'link': '',
+                'snippet': f'Error searching Tavily for "{query}": {str(e)}'
+            }], indent=2)
 
 # Create search tool instance
 search_tool = WebSearchTool()
@@ -1172,9 +1247,13 @@ def main():
         if enable_web_search:
             search_method = st.radio(
                 "Search Method",
-                options=["selenium", "duckduckgo"],
-                format_func=lambda x: "🌐 Selenium (Headless Browser)" if x == "selenium" else "🦆 DuckDuckGo API",
-                help="Selenium is more reliable but slower. DuckDuckGo is faster but may be rate-limited."
+                options=["selenium", "duckduckgo", "tavily"],
+                format_func=lambda x: {
+                    "selenium": "🌐 Selenium (Headless Browser)",
+                    "duckduckgo": "🦆 DuckDuckGo API",
+                    "tavily": "🔍 Tavily Search API",
+                }[x],
+                help="Selenium is more reliable but slower. DuckDuckGo is faster but may be rate-limited. Tavily is an AI-optimized search API (requires API key)."
             )
             st.session_state.search_method = search_method
             
@@ -1198,6 +1277,20 @@ def main():
                         st.info(f"🍎 **MacOS Intel** - Both browsers should work well")
                 else:
                     st.info(f"💡 Using {browser_type.capitalize()} in headless mode")
+            elif search_method == "tavily":
+                tavily_key = st.text_input(
+                    "Tavily API Key",
+                    value=os.environ.get('TAVILY_API_KEY', ''),
+                    type="password",
+                    help="Get your free API key at https://app.tavily.com"
+                )
+                st.session_state.tavily_api_key = tavily_key
+                if not TAVILY_AVAILABLE:
+                    st.warning("⚠️ tavily-python package not installed. Run: `pip install tavily-python`")
+                elif not tavily_key:
+                    st.warning("⚠️ Please enter a Tavily API key or set the TAVILY_API_KEY environment variable.")
+                else:
+                    st.info("💡 Using Tavily Search API (AI-optimized search)")
             else:
                 st.info("💡 Using DuckDuckGo API (may be rate-limited)")
         else:

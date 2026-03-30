@@ -13,6 +13,7 @@ litellm>=1.0.0,<2.0.0
 
 # Web Search and Scraping
 duckduckgo-search>=5.0.0
+tavily-python>=0.3.0
 beautifulsoup4>=4.12.0
 requests>=2.31.0
 lxml>=4.9.0

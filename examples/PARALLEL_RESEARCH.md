@@ -70,7 +70,8 @@ Redirect standard output to save the report:
 python examples/parallel_research.py "AI healthcare diagnostic accuracy" > sources.md
 ```
 
-The report is written as UTF-8, including when output is redirected to a file.
+The example emits UTF-8 on standard output. Some older shells may re-encode
+redirected output; check your shell's encoding settings if the saved text looks wrong.
 
 Review the URLs, dates, and excerpts alongside the app's Web Research Findings
 before writing or publishing. Verify claims against the original sources. This

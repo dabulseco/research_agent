@@ -1,0 +1,3 @@
+# Optional Parallel example environment and test bytecode
+.venv-parallel/
+examples/__pycache__/

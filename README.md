@@ -419,6 +419,11 @@ Ollama. The app sets a dummy key automatically. No real OpenAI API key is needed
 
 The repository includes several supplementary documents for deeper reference:
 
+For optional hosted source gathering outside the Streamlit workflow, see the
+[Parallel Search MCP example](examples/PARALLEL_RESEARCH.md). It sends your query
+and selected URLs to Parallel and produces a separate source report; the app's
+local Ollama workflow and search settings stay unchanged.
+
 | File | Contents |
 |------|----------|
 | `QUICK_REFERENCE.md` | One-page cheat sheet for the enhanced search system |

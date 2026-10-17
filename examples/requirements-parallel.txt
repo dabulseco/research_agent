@@ -1,0 +1,3 @@
+# Optional standalone example only; not required by the Streamlit application.
+mcp>=1.30.0,<2
+httpx>=0.27,<1
